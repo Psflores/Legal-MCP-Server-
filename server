@@ -1,0 +1,394 @@
+#!/usr/bin/env node
+
+/**
+ * Servidor MCP Legal Argentino - Versión Optimizada v2.1
+ * 
+ * Un servidor MCP especializado para documentos legales argentinos
+ * con búsqueda inteligente, optimizaciones de performance y manejo robusto de errores.
+ * 
+ * @author Tu Nombre
+ * @version 2.1.0
+ * @license MIT
+ */
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
+import fs from 'fs/promises';
+import fsSync from 'fs';
+import path from 'path';
+import { open } from 'sqlite';
+import sqlite3 from 'sqlite3';
+import cache from 'memory-cache';
+
+// Configuración optimizada
+const CONFIG = {
+  ocrProjectPath: process.env.LEGAL_PROJECT_PATH || '/Users/psfm4/legal_ocr_project',
+  dbPath: process.env.LEGAL_DB_PATH || '/Users/psfm4/legal_ocr_project/legal_mcp.db',
+  cacheSize: parseInt(process.env.CACHE_SIZE) || 256, // MB
+  cacheTTL: parseInt(process.env.CACHE_TTL) || 300000, // 5 minutos
+  logLevel: process.env.LOG_LEVEL || 'info',
+  maxQueryLength: 500,
+  defaultLimit: 10,
+  maxLimit: 100
+};
+
+/**
+ * Logger simple con niveles
+ */
+class Logger {
+  static levels = { error: 0, warn: 1, info: 2, debug: 3 };
+  static currentLevel = Logger.levels[CONFIG.logLevel] || 2;
+
+  static log(level, message, data = null) {
+    if (Logger.levels[level] <= Logger.currentLevel) {
+      const timestamp = new Date().toISOString();
+      const logMessage = data 
+        ? `[${timestamp}] ${level.toUpperCase()}: ${message} ${JSON.stringify(data)}`
+        : `[${timestamp}] ${level.toUpperCase()}: ${message}`;
+      console.log(logMessage);
+    }
+  }
+
+  static error(message, data) { Logger.log('error', message, data); }
+  static warn(message, data) { Logger.log('warn', message, data); }
+  static info(message, data) { Logger.log('info', message, data); }
+  static debug(message, data) { Logger.log('debug', message, data); }
+}
+
+/**
+ * Monitor de performance para operaciones
+ */
+class PerformanceMonitor {
+  static startTimer(operation) {
+    return { operation, start: process.hrtime.bigint() };
+  }
+
+  static endTimer(timer) {
+    const duration = Number(process.hrtime.bigint() - timer.start) / 1000000; // ms
+    Logger.debug(`Performance: ${timer.operation}`, { duration: `${duration.toFixed(2)}ms` });
+    return duration;
+  }
+}
+
+/**
+ * Pool de conexiones SQLite para mejor concurrencia
+ */
+class ConnectionPool {
+  constructor(dbPath, poolSize = 3) {
+    this.dbPath = dbPath;
+    this.poolSize = poolSize;
+    this.connections = [];
+    this.available = [];
+    this.waitingQueue = [];
+  }
+
+  async initialize() {
+    Logger.info(`Inicializando pool de conexiones (${this.poolSize} conexiones)`);
+    
+    for (let i = 0; i < this.poolSize; i++) {
+      const db = await open({
+        filename: this.dbPath,
+        driver: sqlite3.Database
+      });
+      
+      // Optimizaciones SQLite
+      await db.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = normal;
+        PRAGMA temp_store = memory;
+        PRAGMA mmap_size = 268435456;
+        PRAGMA cache_size = 10000;
+        PRAGMA foreign_keys = ON;
+      `);
+      
+      this.connections.push(db);
+      this.available.push(db);
+    }
+    
+    Logger.info('Pool de conexiones inicializado correctamente');
+  }
+
+  async getConnection() {
+    if (this.available.length > 0) {
+      return this.available.pop();
+    }
+
+    // Si no hay conexiones disponibles, esperar
+    return new Promise((resolve) => {
+      this.waitingQueue.push(resolve);
+    });
+  }
+
+  releaseConnection(db) {
+    if (this.waitingQueue.length > 0) {
+      const resolve = this.waitingQueue.shift();
+      resolve(db);
+    } else {
+      this.available.push(db);
+    }
+  }
+
+  async closeAll() {
+    Logger.info('Cerrando pool de conexiones');
+    for (const db of this.connections) {
+      await db.close();
+    }
+    this.connections = [];
+    this.available = [];
+  }
+}
+
+/**
+ * Validador de entrada para seguridad
+ */
+class InputValidator {
+  static validateSearchArgs(args) {
+    const errors = [];
+
+    if (args.query && typeof args.query !== 'string') {
+      errors.push('Query debe ser string');
+    }
+
+    if (args.query && args.query.length > CONFIG.maxQueryLength) {
+      errors.push(`Query demasiado largo (máximo ${CONFIG.maxQueryLength} caracteres)`);
+    }
+
+    if (args.limit && (args.limit < 1 || args.limit > CONFIG.maxLimit)) {
+      errors.push(`Limit debe estar entre 1 y ${CONFIG.maxLimit}`);
+    }
+
+    if (args.practice_area && typeof args.practice_area !== 'string') {
+      errors.push('Practice area debe ser string');
+    }
+
+    if (args.author && typeof args.author !== 'string') {
+      errors.push('Author debe ser string');
+    }
+
+    if (errors.length > 0) {
+      throw new Error(`Errores de validación: ${errors.join(', ')}`);
+    }
+
+    // Sanitizar entrada
+    return {
+      query: args.query?.trim().slice(0, CONFIG.maxQueryLength),
+      practice_area: args.practice_area?.trim(),
+      author: args.author?.trim(),
+      limit: Math.min(args.limit || CONFIG.defaultLimit, CONFIG.maxLimit),
+      offset: Math.max(args.offset || 0, 0)
+    };
+  }
+
+  static validateDocumentId(documentId) {
+    if (!documentId || !Number.isInteger(documentId) || documentId < 1) {
+      throw new Error('Document ID debe ser un entero positivo');
+    }
+    return documentId;
+  }
+}
+
+/**
+ * Servidor MCP Legal principal con optimizaciones
+ */
+class LegalMCPServer {
+  constructor() {
+    this.server = new Server(
+      {
+        name: 'legal-argentina-server',
+        version: '2.1.0',
+      },
+      {
+        capabilities: {
+          tools: {},
+        },
+      }
+    );
+    this.connectionPool = null;
+    this.stats = {
+      requests: 0,
+      errors: 0,
+      cacheHits: 0,
+      cacheMisses: 0
+    };
+  }
+
+  async initialize() {
+    Logger.info('🚀 Iniciando Servidor MCP Legal Argentino v2.1...');
+    
+    try {
+      await this.setupDatabase();
+      await this.loadExistingDocuments();
+      this.setupHandlers();
+      this.setupGracefulShutdown();
+      
+      Logger.info('✅ Servidor inicializado correctamente');
+    } catch (error) {
+      Logger.error('❌ Error durante inicialización', { error: error.message });
+      throw error;
+    }
+  }
+
+  async setupDatabase() {
+    try {
+      this.connectionPool = new ConnectionPool(CONFIG.dbPath);
+      await this.connectionPool.initialize();
+      
+      const db = await this.connectionPool.getConnection();
+      
+      // Crear esquema optimizado
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS legal_documents (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          author TEXT,
+          practice_area TEXT,
+          document_type TEXT,
+          content TEXT,
+          content_hash TEXT,
+          processed_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Índices optimizados para consultas frecuentes
+        CREATE INDEX IF NOT EXISTS idx_practice_area_author ON legal_documents(practice_area, author);
+        CREATE INDEX IF NOT EXISTS idx_title_content ON legal_documents(title, practice_area);
+        CREATE INDEX IF NOT EXISTS idx_processed_date ON legal_documents(processed_date DESC);
+        CREATE INDEX IF NOT EXISTS idx_content_hash ON legal_documents(content_hash);
+
+        -- Tabla para estadísticas de uso
+        CREATE TABLE IF NOT EXISTS usage_stats (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL,
+          parameters TEXT,
+          execution_time REAL,
+          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Trigger para updated_at
+        CREATE TRIGGER IF NOT EXISTS update_legal_documents_updated_at 
+        AFTER UPDATE ON legal_documents
+        BEGIN
+          UPDATE legal_documents SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+        END;
+      `);
+      
+      this.connectionPool.releaseConnection(db);
+      Logger.info('✅ Base de datos configurada con optimizaciones');
+    } catch (error) {
+      Logger.error('❌ Error configurando base de datos', { error: error.message });
+      throw error;
+    }
+  }
+
+  async loadExistingDocuments() {
+    try {
+      const db = await this.connectionPool.getConnection();
+      const count = await db.get('SELECT COUNT(*) as total FROM legal_documents');
+      this.connectionPool.releaseConnection(db);
+      
+      if (count.total > 0) {
+        Logger.info(`📚 ${count.total} documentos ya cargados en base de datos`);
+        return;
+      }
+
+      // Cargar desde JSON existente
+      const processedFile = path.join(CONFIG.ocrProjectPath, 'processed_legal_docs', 'legal_docs_20250625_005047.json');
+      
+      if (fsSync.existsSync(processedFile)) {
+        await this.importDocumentsFromFile(processedFile);
+      } else {
+        Logger.warn('No se encontró archivo de documentos para cargar');
+      }
+    } catch (error) {
+      Logger.error('Error cargando documentos existentes', { error: error.message });
+    }
+  }
+
+  async importDocumentsFromFile(filePath) {
+    const timer = PerformanceMonitor.startTimer('import_documents');
+    
+    try {
+      const data = JSON.parse(await fs.readFile(filePath, 'utf8'));
+      Logger.info(`📂 Importando ${data.length} documentos...`);
+
+      const db = await this.connectionPool.getConnection();
+      await db.run('BEGIN TRANSACTION');
+
+      const stmt = await db.prepare(`
+        INSERT INTO legal_documents (title, author, practice_area, document_type, content, content_hash)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const doc of data) {
+        const contentHash = this.generateContentHash(doc.content || '');
+        await stmt.run([
+          doc.title || 'Sin título',
+          doc.author || 'Sin autor',
+          doc.practice_area || 'General',
+          doc.document_type || 'Unknown',
+          doc.content || '',
+          contentHash
+        ]);
+      }
+
+      await stmt.finalize();
+      await db.run('COMMIT');
+      this.connectionPool.releaseConnection(db);
+      
+      PerformanceMonitor.endTimer(timer);
+      Logger.info(`✅ ${data.length} documentos importados correctamente`);
+    } catch (error) {
+      Logger.error('Error importando documentos', { error: error.message });
+      throw error;
+    }
+  }
+
+  generateContentHash(content) {
+    // Hash simple para detectar duplicados
+    let hash = 0;
+    for (let i = 0; i < content.length; i++) {
+      const char = content.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return hash.toString();
+  }
+
+  setupHandlers() {
+    // Handler para listar herramientas
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+      return {
+        tools: [
+          {
+            name: 'search_legal_documents',
+            description: 'Buscar documentos legales por texto, área, autor con búsqueda optimizada',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: {
+                  type: 'string',
+                  description: 'Texto a buscar en título, contenido o autor'
+                },
+                practice_area: {
+                  type: 'string',
+                  description: 'Área de práctica (familia, civil, procesal, etc.)'
+                },
+                author: {
+                  type: 'string',
+                  description: 'Autor del documento'
+                },
+                limit: {
+                  type: 'number',
+                  description: `Número máximo de resultados (1-${CONFIG.maxLimit})`,
+                  default: CONFIG.defaultLimit,
+                  minimum: 1,
+                  maximum: CONFIG.maxLimit
+                },
+                offset: {
+                  type: 'number',
+                  description: 'Número de resultados a om
